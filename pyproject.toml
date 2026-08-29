@@ -14,10 +14,10 @@ dependencies = [
     "kiteconnect>=5.0",
 ]
 
-# TradingAgents is deliberately NOT listed above. It is installed separately as
-# an editable pointer at the local clone (see README), so `git pull` in that
-# clone is the whole upgrade process and this project never vendors or patches
-# upstream code.
+# TradingAgents is deliberately NOT listed above. It is vendored as a pinned
+# git submodule at vendor/TradingAgents (see README) and installed separately
+# as an editable pointer at that path, so bumping the submodule pin is the
+# whole upgrade process and this project never patches or forks upstream code.
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0", "ruff>=0.15"]

@@ -8,9 +8,10 @@ Zerodha via [Kite Connect v3](https://kite.trade/docs/connect/v3/).
 
 ## Why this is a separate project
 
-TradingAgents is consumed as an installed library and is **never edited**. Upgrading
-is just `git pull` in the upstream clone — there is nothing here to merge, rebase,
-or re-apply.
+TradingAgents is vendored as a **pinned git submodule** at `vendor/TradingAgents` and
+is **never edited**. Upgrading is a deliberate two-step bump — `git submodule update
+--remote vendor/TradingAgents` to move the pin, then re-run the editable install —
+never a merge, rebase, or re-apply against this project's own history.
 
 All upstream contact is funnelled through one file, `kite_trader/agents.py`, which
 depends on three documented names:
@@ -25,29 +26,42 @@ That module validates the shape it gets back on every call and raises `UpstreamE
 with a pointer to itself if upstream drifts — so an API change surfaces as one clear
 message in one known file, not as a mystery HOLD on a live account.
 
-Currently pinned against upstream `a33fd4c` (2026-07-18), TradingAgents v0.3.1.
+Currently pinned at submodule commit `a33fd4c` (2026-07-18), TradingAgents v0.3.1 —
+see `git -C vendor/TradingAgents log -1` for the live pin, which is authoritative over
+this paragraph.
 
 ## Layout
 
 ```
-~/TradingAgents/          upstream clone — read-only, git pull freely
-~/kite-trader/            this project
+kite-trader/                 this project
+  vendor/TradingAgents/      git submodule, pinned — read-only, never edited
   kite_trader/
-    agents.py             the ONLY module that imports tradingagents
-    zerodha.py            Kite Connect v3 client (session, funds, quotes, orders)
-    watchlist.py          watchlist parsing + rating -> BUY/SELL/HOLD
-    runner.py             orchestration and CLI
-  watchlist.txt           your symbols
-  runs/                   JSON record of every run (git-ignored)
+    agents.py                the ONLY module that imports tradingagents
+    zerodha.py               Kite Connect v3 client (session, funds, quotes, orders)
+    watchlist.py             watchlist parsing + rating -> BUY/SELL/HOLD
+    runner.py                orchestration and CLI
+  watchlist.txt               your symbols
+  runs/                       JSON record of every run (git-ignored)
 ```
 
 ## Setup
 
 ```bash
-cd ~/kite-trader
+git clone --recurse-submodules <this-repo-url>
+cd kite-trader
+# already cloned without --recurse-submodules? run: git submodule update --init
 python3.12 -m venv .venv
-.venv/bin/pip install -e ~/TradingAgents -e ".[dev]"
+.venv/bin/pip install -e vendor/TradingAgents -e ".[dev]"
 cp .env.example .env      # then fill in the keys
+```
+
+To move to a newer upstream commit:
+
+```bash
+git submodule update --remote vendor/TradingAgents   # advances the pin
+.venv/bin/pip install -e vendor/TradingAgents          # re-install at the new pin
+git add vendor/TradingAgents
+git commit -m "bump TradingAgents to <new-sha>"
 ```
 
 You need a Zerodha account with TOTP 2FA and a Kite Connect app

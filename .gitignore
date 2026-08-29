@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 runs/
 kite_session.json
+
+# scripts/make_list.py output - a generated instrument dump, not source
+instruments_*.csv
