@@ -115,13 +115,19 @@ def test_cached_token_file_is_owner_only(tmp_path):
 
 
 # ------------------------------------------------------------- transport
+#
+# ZerodhaBroker delegates the actual HTTP call to kiteconnect.KiteConnect, so
+# the boundary worth mocking is its ``reqsession`` (a plain requests.Session)
+# rather than anything of ours — this is the same substitution kiteconnect
+# itself makes internally when its own test suite mocks requests.
 
 def _broker_with_response(status_code, payload, session_path):
     broker = ZerodhaBroker("key", "secret", access_token="token", session_path=session_path)
     response = MagicMock(status_code=status_code)
+    response.headers = {"content-type": "application/json; charset=utf-8"}
     response.json.return_value = payload
-    broker._http = MagicMock()
-    broker._http.request.return_value = response
+    broker._kite.reqsession = MagicMock()
+    broker._kite.reqsession.request.return_value = response
     return broker
 
 
@@ -139,20 +145,41 @@ def test_token_exception_raises_the_recoverable_auth_error(tmp_path):
 def test_other_errors_raise_plain_kite_error(tmp_path):
     broker = _broker_with_response(
         400,
-        {"status": "error", "message": "Insufficient funds", "error_type": "MarginException"},
+        {"status": "error", "message": "Order could not be placed", "error_type": "OrderException"},
         tmp_path / "s.json",
     )
     with pytest.raises(KiteError) as exc:
         broker.profile()
     assert not isinstance(exc.value, KiteAuthError)
-    assert exc.value.error_type == "MarginException"
+    assert exc.value.error_type == "OrderException"
+
+
+def test_unrecognised_error_type_falls_back_to_general_exception(tmp_path):
+    # Kite documents a fixed error_type taxonomy; kiteconnect maps anything
+    # outside it to GeneralException rather than inventing a new class.
+    broker = _broker_with_response(
+        400,
+        {"status": "error", "message": "Something odd", "error_type": "SomeFutureException"},
+        tmp_path / "s.json",
+    )
+    with pytest.raises(KiteError) as exc:
+        broker.profile()
+    assert exc.value.error_type == "GeneralException"
 
 
 def test_authorization_header_matches_kite_format(tmp_path):
     broker = _broker_with_response(200, {"status": "success", "data": {}}, tmp_path / "s.json")
     broker.profile()
-    headers = broker._http.request.call_args.kwargs["headers"]
+    headers = broker._kite.reqsession.request.call_args.kwargs["headers"]
     assert headers["Authorization"] == "token key:token"
+
+
+def test_call_without_access_token_fails_fast_without_a_network_call(tmp_path):
+    broker = ZerodhaBroker("key", "secret", session_path=tmp_path / "s.json")
+    broker._kite.reqsession = MagicMock()
+    with pytest.raises(KiteAuthError):
+        broker.profile()
+    broker._kite.reqsession.request.assert_not_called()
 
 
 # ---------------------------------------------------------------- portfolio
@@ -181,10 +208,11 @@ def test_place_order_sends_the_documented_payload(tmp_path):
     )
     assert order_id == "2508290001"
 
-    call = broker._http.request.call_args
+    call = broker._kite.reqsession.request.call_args
     assert call.args[0] == "POST"
     assert call.args[1].endswith("/orders/regular")
     assert call.kwargs["data"] == {
+        "variety": "regular",  # kiteconnect echoes it into the body too, alongside the URL
         "exchange": "NSE",
         "tradingsymbol": "RELIANCE",
         "transaction_type": "BUY",
@@ -202,7 +230,8 @@ def test_order_tag_is_truncated_to_kites_limit(tmp_path):
         200, {"status": "success", "data": {"order_id": "1"}}, tmp_path / "s.json"
     )
     broker.place_order("NSE:TCS", "SELL", 1, tag="x" * 40)
-    assert len(broker._http.request.call_args.kwargs["data"]["tag"]) == 20
+    tag = broker._kite.reqsession.request.call_args.kwargs["data"]["tag"]
+    assert len(tag) == 20
 
 
 def test_ltp_requests_all_instruments_in_one_call(tmp_path):
@@ -215,7 +244,7 @@ def test_ltp_requests_all_instruments_in_one_call(tmp_path):
         tmp_path / "s.json",
     )
     assert broker.ltp(["NSE:TCS", "NSE:INFY"]) == {"NSE:TCS": 3100.5, "NSE:INFY": 1450.0}
-    assert broker._http.request.call_count == 1
+    assert broker._kite.reqsession.request.call_count == 1
 
 
 def test_ltp_omits_instruments_kite_had_no_data_for(tmp_path):

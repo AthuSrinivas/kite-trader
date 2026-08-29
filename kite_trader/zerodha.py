@@ -1,17 +1,24 @@
 """Zerodha Kite Connect v3 client — the execution leg of a watchlist run.
 
 The agent pipeline produces a rating; this module turns a rating into a real
-order. It speaks the REST API directly (https://api.kite.trade) with
-``requests`` rather than pulling in ``pykiteconnect``: the surface we need is
-small — session, margins, holdings, LTP, place order — and going direct keeps
-the dependency list short and the failure modes visible.
+order. Transport (auth exchange, request signing, response/error parsing) is
+delegated to Zerodha's own SDK, ``kiteconnect`` (PyPI: ``kiteconnect``,
+imported as ``pykiteconnect`` upstream): everything in this file that talks to
+``api.kite.trade`` goes through a ``KiteConnect`` instance rather than raw
+``requests`` calls, so REST-contract changes get fixed upstream instead of here.
+
+What ``kiteconnect`` does NOT give you, and what this file still owns:
+session *lifecycle* — the 6 AM IST expiry, the on-disk cache, and the
+"reuse cache -> exchange KITE_REQUEST_TOKEN -> interactive login" fallback
+chain. The SDK only exposes the primitives (``generate_session``,
+``set_access_token``); it has no opinion on caching or when a token is stale.
 
 Auth, in Kite's own terms (kite.trade/docs/connect/v3/user/):
 
     1. Send the user to ``https://kite.zerodha.com/connect/login?v=3&api_key=``
     2. They return to the app's registered redirect URL with a ``request_token``
-    3. POST that plus ``checksum = sha256(api_key + request_token + api_secret)``
-       to ``/session/token``, which returns an ``access_token``
+    3. Exchange that (plus ``api_secret``) via ``generate_session()``, which
+       returns an ``access_token`` and sets it on the client
     4. Every later call carries ``Authorization: token <api_key>:<access_token>``
 
 The sharp edge is step 4: Kite invalidates every access token at 6:00 AM IST
@@ -29,7 +36,6 @@ Environment:
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import os
@@ -42,11 +48,11 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
+from kiteconnect import KiteConnect
+from kiteconnect import exceptions as kite_ex
 
 logger = logging.getLogger(__name__)
 
-API_ROOT = "https://api.kite.trade"
-LOGIN_URL = "https://kite.zerodha.com/connect/login?v=3&api_key={api_key}"
 IST = ZoneInfo("Asia/Kolkata")
 
 # Kite kills every access token at 6:00 AM IST, whenever it was issued.
@@ -72,7 +78,12 @@ DEFAULT_SESSION_PATH = Path.home() / ".kite-trader" / "session.json"
 
 
 class KiteError(RuntimeError):
-    """An error returned by the Kite API, carrying its typed ``error_type``."""
+    """An error returned by the Kite API, carrying its typed ``error_type``.
+
+    ``error_type`` is the name of the ``kiteconnect.exceptions`` class Zerodha's
+    SDK mapped the response to (``GeneralException``, ``OrderException``, ...),
+    which mirrors Kite's own documented error taxonomy.
+    """
 
     def __init__(self, message: str, error_type: str = "GeneralException", status_code: int = 0):
         super().__init__(message)
@@ -166,7 +177,7 @@ class OrderResult:
 
 
 class ZerodhaBroker:
-    """Thin Kite Connect v3 client: session handling plus the calls we need."""
+    """Session lifecycle plus the calls we need, on top of ``kiteconnect.KiteConnect``."""
 
     def __init__(
         self,
@@ -180,11 +191,11 @@ class ZerodhaBroker:
             raise ValueError("api_key is required (set KITE_API_KEY)")
         self.api_key = api_key
         self.api_secret = api_secret
-        self.access_token = access_token
         self.session_path = Path(session_path)
         self.timeout = timeout
-        self._http = requests.Session()
-        self._http.headers.update({"X-Kite-Version": "3"})
+        self._kite = KiteConnect(api_key=api_key, timeout=timeout)
+        self._access_token: str | None = None
+        self.access_token = access_token  # property setter also primes self._kite
 
     @classmethod
     def from_env(cls, session_path: Path | str = DEFAULT_SESSION_PATH) -> ZerodhaBroker:
@@ -198,8 +209,21 @@ class ZerodhaBroker:
     # ---------------------------------------------------------------- session
 
     @property
+    def access_token(self) -> str | None:
+        return self._access_token
+
+    @access_token.setter
+    def access_token(self, value: str | None) -> None:
+        # Keep this wrapper's notion of the token and the underlying SDK
+        # client's in lock-step, so every call site that does
+        # ``self.access_token = ...`` (cache load, generate_session, logout)
+        # automatically takes effect on the next ``self._kite`` call.
+        self._access_token = value
+        self._kite.set_access_token(value)
+
+    @property
     def login_url(self) -> str:
-        return LOGIN_URL.format(api_key=self.api_key)
+        return self._kite.login_url()
 
     def ensure_session(self, interactive: bool = True) -> str:
         """Return a usable access token, minting one if the cached one has died.
@@ -242,34 +266,17 @@ class ZerodhaBroker:
             raise ValueError(
                 "api_secret is required to exchange a request token (set KITE_API_SECRET)"
             )
-        checksum = hashlib.sha256(
-            (self.api_key + request_token + self.api_secret).encode("utf-8")
-        ).hexdigest()
-
-        data = self._request(
-            "POST",
-            "/session/token",
-            data={
-                "api_key": self.api_key,
-                "request_token": request_token,
-                "checksum": checksum,
-            },
-            authenticated=False,
-        )
+        data = self._call(self._kite.generate_session, request_token, self.api_secret)
         self.access_token = data["access_token"]
         self._cache_token(self.access_token, user_id=data.get("user_id"))
         logger.info("Kite session established for %s", data.get("user_id"))
         return self.access_token
 
     def invalidate_session(self) -> None:
-        """DELETE /session/token — log the API session out and drop the cache."""
+        """Log the API session out and drop the cache."""
         if not self.access_token:
             return
-        self._request(
-            "DELETE",
-            "/session/token",
-            params={"api_key": self.api_key, "access_token": self.access_token},
-        )
+        self._call(self._kite.invalidate_access_token)
         self.access_token = None
         self.session_path.unlink(missing_ok=True)
 
@@ -316,60 +323,40 @@ class ZerodhaBroker:
 
     # -------------------------------------------------------------- transport
 
-    def _request(
-        self,
-        method: str,
-        path: str,
-        params: dict[str, Any] | None = None,
-        data: dict[str, Any] | None = None,
-        authenticated: bool = True,
-    ) -> Any:
-        headers = {}
-        if authenticated:
-            if not self.access_token:
-                raise KiteAuthError(
-                    "No access token; call ensure_session() first", error_type="TokenException"
-                )
-            headers["Authorization"] = f"token {self.api_key}:{self.access_token}"
+    def _call(self, fn, *args: Any, **kwargs: Any) -> Any:
+        """Run a ``kiteconnect`` call, translating its exceptions into ours.
 
+        ``kiteconnect`` raises a typed subclass of ``KiteException`` for every
+        API-level error (matching Kite's own documented error taxonomy) but
+        lets ``requests`` exceptions (timeouts, connection errors) escape
+        unwrapped — both are normalised to :class:`KiteError` /
+        :class:`KiteAuthError` here so callers only ever see this module's
+        two exception types.
+        """
         try:
-            response = self._http.request(
-                method,
-                API_ROOT + path,
-                params=params,
-                data=data,
-                headers=headers,
-                timeout=self.timeout,
-            )
+            return fn(*args, **kwargs)
+        except kite_ex.TokenException as exc:
+            raise KiteAuthError(str(exc), error_type="TokenException", status_code=exc.code) from exc
+        except kite_ex.KiteException as exc:
+            raise KiteError(str(exc), error_type=type(exc).__name__, status_code=exc.code) from exc
         except requests.RequestException as exc:
             raise KiteError(f"Kite request failed: {exc}", error_type="NetworkException") from exc
 
-        try:
-            payload = response.json()
-        except ValueError:
-            raise KiteError(
-                f"Non-JSON response from Kite ({response.status_code}): {response.text[:200]}",
-                error_type="DataException",
-                status_code=response.status_code,
-            ) from None
-
-        if response.status_code >= 400 or payload.get("status") == "error":
-            message = payload.get("message", "unknown error")
-            error_type = payload.get("error_type", "GeneralException")
-            # TokenException is the one worth distinguishing: it is the daily
-            # expiry, and the caller can recover from it by re-authenticating.
-            error = KiteAuthError if error_type == "TokenException" else KiteError
-            raise error(message, error_type=error_type, status_code=response.status_code)
-
-        return payload.get("data")
+    def _authed_call(self, fn, *args: Any, **kwargs: Any) -> Any:
+        """Like :meth:`_call`, but fails fast (no network call) without a token."""
+        if not self.access_token:
+            raise KiteAuthError(
+                "No access token; call ensure_session() first", error_type="TokenException"
+            )
+        return self._call(fn, *args, **kwargs)
 
     # ------------------------------------------------------------- user/funds
 
     def profile(self) -> dict[str, Any]:
-        return self._request("GET", "/user/profile")
+        return self._authed_call(self._kite.profile)
 
     def margins(self, segment: str = "equity") -> dict[str, Any]:
-        return self._request("GET", f"/user/margins/{segment}")
+        return self._authed_call(self._kite.margins, segment)
 
     def available_cash(self, segment: str = "equity") -> float:
         """Usable balance for a segment — Kite's ``net`` figure under margins."""
@@ -378,7 +365,7 @@ class ZerodhaBroker:
     # -------------------------------------------------------------- portfolio
 
     def holdings(self) -> list[dict[str, Any]]:
-        return self._request("GET", "/portfolio/holdings") or []
+        return self._authed_call(self._kite.holdings) or []
 
     def sellable_quantities(self) -> dict[str, int]:
         """Map ``exchange:tradingsymbol`` -> quantity sellable today.
@@ -398,7 +385,7 @@ class ZerodhaBroker:
         return quantities
 
     def positions(self) -> dict[str, list[dict[str, Any]]]:
-        return self._request("GET", "/portfolio/positions") or {"net": [], "day": []}
+        return self._authed_call(self._kite.positions) or {"net": [], "day": []}
 
     # ------------------------------------------------------------ market data
 
@@ -410,7 +397,7 @@ class ZerodhaBroker:
         """
         if not instruments:
             return {}
-        data = self._request("GET", "/quote/ltp", params={"i": instruments}) or {}
+        data = self._authed_call(self._kite.ltp, instruments) or {}
         return {key: float(value["last_price"]) for key, value in data.items()}
 
     # ----------------------------------------------------------------- orders
@@ -428,33 +415,29 @@ class ZerodhaBroker:
         validity: str = "DAY",
         tag: str | None = None,
     ) -> str:
-        """POST /orders/:variety — returns the ``order_id``.
+        """Place an order — returns the ``order_id``.
 
         An order id means the order reached Kite's OMS, not that it filled;
         poll :meth:`order_history` for the terminal status.
         """
         exchange, _, tradingsymbol = instrument.partition(":")
-        payload: dict[str, Any] = {
-            "exchange": exchange,
-            "tradingsymbol": tradingsymbol,
-            "transaction_type": transaction_type,
-            "quantity": int(quantity),
-            "product": product,
-            "order_type": order_type,
-            "validity": validity,
-        }
-        if price is not None:
-            payload["price"] = round_to_tick(price)
-        if trigger_price is not None:
-            payload["trigger_price"] = round_to_tick(trigger_price)
-        if tag:
-            payload["tag"] = tag[:20]  # Kite rejects tags longer than 20 chars
-
-        data = self._request("POST", f"/orders/{variety}", data=payload)
-        return data["order_id"]
+        return self._authed_call(
+            self._kite.place_order,
+            variety=variety,
+            exchange=exchange,
+            tradingsymbol=tradingsymbol,
+            transaction_type=transaction_type,
+            quantity=int(quantity),
+            product=product,
+            order_type=order_type,
+            price=round_to_tick(price) if price is not None else None,
+            trigger_price=round_to_tick(trigger_price) if trigger_price is not None else None,
+            validity=validity,
+            tag=tag[:20] if tag else None,  # Kite rejects tags longer than 20 chars
+        )
 
     def orders(self) -> list[dict[str, Any]]:
-        return self._request("GET", "/orders") or []
+        return self._authed_call(self._kite.orders) or []
 
     def order_history(self, order_id: str) -> list[dict[str, Any]]:
-        return self._request("GET", f"/orders/{order_id}") or []
+        return self._authed_call(self._kite.order_history, order_id) or []
