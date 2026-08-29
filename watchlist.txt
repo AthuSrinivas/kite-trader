@@ -1,0 +1,13 @@
+# TradingAgents watchlist — one instrument per line.
+#
+#   SYMBOL          use the run's default quantity (--qty / --capital-per-trade)
+#   SYMBOL, 5       fixed quantity for this symbol
+#
+# Yahoo-style suffixes, because the analysis path fetches from Yahoo Finance:
+#   .NS -> NSE, .BO -> BSE.  A bare symbol is assumed to be NSE.
+# Blank lines and '#' comments are ignored.
+
+RELIANCE.NS
+TCS.NS
+INFY.NS
+HDFCBANK.NS

@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kite-trader"
+version = "0.1.0"
+description = "Run the TradingAgents pipeline over a watchlist and route the ratings to Zerodha Kite Connect"
+requires-python = ">=3.12"
+dependencies = [
+    "requests>=2.32",
+    "python-dotenv>=1.0",
+    "rich>=14.0",
+]
+
+# TradingAgents is deliberately NOT listed above. It is installed separately as
+# an editable pointer at the local clone (see README), so `git pull` in that
+# clone is the whole upgrade process and this project never vendors or patches
+# upstream code.
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.15"]
+
+[project.scripts]
+kite-trader = "kite_trader.runner:main"
+
+[tool.setuptools.packages.find]
+include = ["kite_trader*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "W", "F", "I", "B", "UP", "C4", "SIM"]
+ignore = ["E501"]
