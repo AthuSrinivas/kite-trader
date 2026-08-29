@@ -48,6 +48,27 @@ console = Console()
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_WATCHLIST = PROJECT_ROOT / "watchlist.txt"
 DEFAULT_RUN_DIR = PROJECT_ROOT / "runs"
+VENDOR_TRADINGAGENTS = PROJECT_ROOT / "vendor" / "TradingAgents"
+
+
+def _load_env_files() -> None:
+    """Load this project's two separate .env files, by explicit path.
+
+    Deliberately two files, not one, so each project only ever declares the
+    keys it actually owns: this repo's .env holds KITE_* (TradingAgents has no
+    use for a Kite credential), and vendor/TradingAgents/.env holds the LLM
+    provider keys (kite_trader never reads an OPENAI_API_KEY itself - it's
+    upstream's DEFAULT_CONFIG that consumes it). Explicit paths matter because
+    ``tradingagents``'s own ``find_dotenv(usecwd=True)`` (run again, harmlessly,
+    when it's imported later) only searches the current directory and its
+    parents - it would never find a .env sitting in a subdirectory like
+    vendor/TradingAgents/, so this project has to hand that one to it directly.
+    ``load_dotenv`` defaults to ``override=False`` and no-ops on a missing
+    path, so the order here is safe either way and neither file is required.
+    """
+    load_dotenv(PROJECT_ROOT / ".env")
+    load_dotenv(VENDOR_TRADINGAGENTS / ".env")
+    load_dotenv(VENDOR_TRADINGAGENTS / ".env.enterprise", override=False)
 
 # Kite allows 10 orders/second; 150ms between placements stays well clear
 # without making a watchlist run feel slow.
@@ -355,7 +376,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    load_dotenv(PROJECT_ROOT / ".env")
+    _load_env_files()
 
     logging.basicConfig(
         level=logging.DEBUG if args.debug else logging.INFO,

@@ -55,8 +55,20 @@ git config submodule.recurse true   # local-only, per clone: makes plain `git
                                      # in sync too, not just this repo's own files
 python3.12 -m venv .venv
 .venv/bin/pip install -e vendor/TradingAgents -e ".[dev]"
-cp .env.example .env      # then fill in the keys
+
+# Two separate .env files, each owned by the project that reads it:
+cp .env.example .env                                              # KITE_* only
+cp vendor/TradingAgents/.env.example vendor/TradingAgents/.env    # LLM provider keys, TRADINGAGENTS_*
+# then fill in both
 ```
+
+Both are loaded by explicit path in `kite_trader/runner.py`, so neither depends on
+which directory you happen to launch `kite-trader` from. This split is deliberate:
+kite-trader never reads an LLM provider key itself, and TradingAgents has no use for
+a Kite credential — each `.env.example` only ever grows the keys its own project
+actually consumes. `vendor/TradingAgents/.env` is untouched by a submodule pin bump
+(`git checkout`/`submodule update` only touches tracked files), so it survives
+upgrading to a newer TradingAgents commit.
 
 To move to a newer upstream commit:
 
