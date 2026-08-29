@@ -50,6 +50,9 @@ kite-trader/                 this project
 git clone --recurse-submodules <this-repo-url>
 cd kite-trader
 # already cloned without --recurse-submodules? run: git submodule update --init
+git config submodule.recurse true   # local-only, per clone: makes plain `git
+                                     # pull`/`checkout` keep vendor/TradingAgents
+                                     # in sync too, not just this repo's own files
 python3.12 -m venv .venv
 .venv/bin/pip install -e vendor/TradingAgents -e ".[dev]"
 cp .env.example .env      # then fill in the keys
